@@ -1,6 +1,8 @@
 """Fault/recovery report processing with per-service monotonic sequence numbers."""
 from __future__ import annotations
 
+import time
+
 from .database import write_tx
 from .errors import ReportConflict, UnknownService
 from .schemas import ReportPayload
@@ -19,9 +21,13 @@ def submit_report(payload: ReportPayload) -> dict:
     * ``seq == last_seq``, differ  -> 409 conflict, no state change.
     * ``seq <  last_seq``          -> stale/late report, 409, never rolls back.
 
-    The service must exist in the currently committed graph.
+    The service must exist in the currently committed graph.  Only an
+    *applied* report (``seq > last_seq``) refreshes the acceptance time used
+    for TTL expiry and clears a latched expiry; idempotent retries and
+    rejected reports leave both untouched.
     """
     wanted = _STATUS_MAP[payload.status]
+    now = time.time()
 
     with write_tx() as conn:
         exists = conn.execute(
@@ -55,11 +61,12 @@ def submit_report(payload: ReportPayload) -> dict:
             current_status = row["status"]
         else:
             conn.execute(
-                "INSERT INTO service_state (service, status, last_seq) "
-                "VALUES (?, ?, ?) "
+                "INSERT INTO service_state (service, status, last_seq, "
+                "accepted_at, expired) VALUES (?, ?, ?, ?, 0) "
                 "ON CONFLICT(service) DO UPDATE SET status = excluded.status, "
-                "last_seq = excluded.last_seq",
-                (payload.service, wanted, payload.seq),
+                "last_seq = excluded.last_seq, "
+                "accepted_at = excluded.accepted_at, expired = 0",
+                (payload.service, wanted, payload.seq, now),
             )
             applied = True
             duplicate = False

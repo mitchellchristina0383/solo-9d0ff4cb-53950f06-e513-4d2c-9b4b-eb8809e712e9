@@ -48,7 +48,15 @@ CREATE TABLE IF NOT EXISTS edges (
 CREATE TABLE IF NOT EXISTS service_state (
     service         TEXT PRIMARY KEY,
     status          TEXT NOT NULL CHECK (status IN ('up', 'down')),
-    last_seq        INTEGER NOT NULL CHECK (last_seq > 0)
+    last_seq        INTEGER NOT NULL CHECK (last_seq > 0),
+    accepted_at     REAL,
+    expired         INTEGER NOT NULL DEFAULT 0
+);
+
+CREATE TABLE IF NOT EXISTS report_ttl (
+    service         TEXT PRIMARY KEY,
+    ttl_seconds     INTEGER NOT NULL CHECK (ttl_seconds > 0),
+    updated_at      TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ', 'now'))
 );
 
 CREATE TABLE IF NOT EXISTS events (
@@ -87,8 +95,35 @@ def init_db() -> None:
     conn = get_connection()
     try:
         conn.executescript(_SCHEMA)
+        _migrate(conn)
     finally:
         close_connection()
+
+
+def _migrate(conn: sqlite3.Connection) -> None:
+    """Bring pre-TTL databases forward: add accepted_at / expired columns.
+
+    ``accepted_at`` is the acceptance time (unix epoch seconds) of the last
+    *applied* report.  For rows written before this column existed we backfill
+    from the events audit table (latest applied event), falling back to now.
+    """
+    cols = {row["name"] for row in conn.execute("PRAGMA table_info(service_state)")}
+    if "accepted_at" not in cols:
+        conn.execute("ALTER TABLE service_state ADD COLUMN accepted_at REAL")
+        conn.execute(
+            """
+            UPDATE service_state
+            SET accepted_at = CAST(COALESCE(
+                (SELECT strftime('%s', MAX(e.recorded_at)) FROM events e
+                 WHERE e.service = service_state.service AND e.applied = 1),
+                strftime('%s', 'now')) AS REAL)
+            """
+        )
+    if "expired" not in cols:
+        conn.execute(
+            "ALTER TABLE service_state "
+            "ADD COLUMN expired INTEGER NOT NULL DEFAULT 0"
+        )
 
 
 @contextmanager

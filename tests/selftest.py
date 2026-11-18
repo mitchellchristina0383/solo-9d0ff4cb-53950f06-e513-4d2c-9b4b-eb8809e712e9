@@ -15,6 +15,7 @@ from __future__ import annotations
 import json
 import os
 import sys
+import time
 import urllib.error
 import urllib.request
 from concurrent.futures import ThreadPoolExecutor
@@ -55,6 +56,30 @@ def request(method: str, path: str, body: dict | None = None):
 def reset() -> None:
     status, _ = request("POST", "/admin/reset")
     assert status == 200, status
+
+
+def alerts_partition_consistent(body: dict) -> bool:
+    """Every node is in exactly one class; down == actionable | suppressed."""
+    nodes = set(body["services"])
+    down = set(body["down_services"])
+    unrep = set(body["unreported_services"])
+    healthy = set(body["healthy_services"])
+    expired = {e["service"] for e in body["expired_services"]}
+    groups = (down, unrep, healthy, expired)
+    if set().union(*groups) != nodes:
+        return False
+    if sum(len(g) for g in groups) != len(nodes):  # pairwise disjoint
+        return False
+    action = {f["service"] for f in body["actionable_faults"]}
+    supp = {f["service"] for f in body["suppressed_faults"]}
+    if action | supp != down or action & supp:
+        return False
+    # Suppression paths may only traverse currently-down services.
+    for fault in body["suppressed_faults"]:
+        for path in fault["paths"]:
+            if not set(path) <= down:
+                return False
+    return True
 
 
 # ---------------------------------------------------------------------------
@@ -432,26 +457,287 @@ def test_concurrency() -> None:
 
     consistent = True
     for st, body in reads:
-        if st != 200:
+        if st != 200 or not alerts_partition_consistent(body):
             consistent = False
             break
-        nodes = set(body["services"])
-        classified = (
-            set(body["down_services"])
-            | set(body["unreported_services"])
-            | set(body["healthy_services"])
-        )
-        action = {f["service"] for f in body["actionable_faults"]}
-        supp = {f["service"] for f in body["suppressed_faults"]}
-        if classified != nodes:
-            consistent = False  # every node belongs to exactly one class
-        if action | supp != set(body["down_services"]) or action & supp:
-            consistent = False  # every down node is either actionable or suppressed
     check(
         "every concurrent read is a consistent single-revision snapshot",
         consistent,
         str(reads[:2]),
     )
+
+
+def test_ttl_expiry() -> None:
+    print("[T6] TTL expiry: status unknown, path cut, automatic reclassification")
+    reset()
+    _, ttl = request("GET", "/ttl")
+    check("reset clears ttl configs", ttl["configs"] == [], str(ttl))
+    request("POST", "/graph", GRAPH_V1)
+
+    status, body = request("PUT", "/ttl/NOPE", {"ttl_seconds": 60})
+    check("ttl for unknown service -> 404", status == 404, str(body))
+    status, _ = request("PUT", "/ttl/D", {"ttl_seconds": 0})
+    check("non-positive ttl -> 422", status == 422)
+    status, body = request("PUT", "/ttl/D", {"ttl_seconds": 2})
+    check(
+        "ttl set on D (not expired yet)",
+        status == 200 and body["ttl_seconds"] == 2 and body["expired"] is False,
+        str(body),
+    )
+    status, body = request("GET", "/ttl")
+    check(
+        "ttl config listed",
+        status == 200 and any(c["service"] == "D" and c["ttl_seconds"] == 2
+                              for c in body["configs"]),
+        str(body),
+    )
+
+    for svc in ("D", "B", "C", "A"):
+        request("POST", "/reports", {"service": svc, "seq": 1, "status": "fault"})
+    _, alerts = request("GET", "/alerts")
+    check(
+        "before expiry: D actionable root",
+        [f["service"] for f in alerts["actionable_faults"]] == ["D"],
+        str(alerts),
+    )
+    check("before expiry: no expired services", alerts["expired_services"] == [], str(alerts))
+
+    time.sleep(2.3)
+    _, alerts = request("GET", "/alerts")
+    expired = {e["service"]: e for e in alerts["expired_services"]}
+    check(
+        "D expired -> status unknown with last status and seq",
+        "D" in expired and expired["D"]["last_status"] == "down"
+        and expired["D"]["last_seq"] == 1,
+        str(alerts),
+    )
+    check(
+        "expired D neither down nor healthy",
+        "D" not in alerts["down_services"] and "D" not in alerts["healthy_services"],
+        str(alerts),
+    )
+    actionable = sorted(f["service"] for f in alerts["actionable_faults"])
+    check(
+        "expired upstream cuts path: B and C immediately actionable",
+        actionable == ["B", "C"],
+        str(alerts),
+    )
+    supp = {f["service"]: f for f in alerts["suppressed_faults"]}
+    check(
+        "A re-suppressed by the live B/C roots only",
+        "A" in supp and supp["A"]["root_causes"] == ["B", "C"]
+        and supp["A"]["paths"] == [["A", "B"], ["A", "C"]],
+        str(alerts),
+    )
+
+    # A new valid report (higher seq) revives D; everything reclassifies.
+    status, body = request("POST", "/reports", {"service": "D", "seq": 2, "status": "fault"})
+    check("higher-seq report applied", status == 200 and body["applied"] is True, str(body))
+    _, alerts = request("GET", "/alerts")
+    check(
+        "after new report: D actionable root again, expiry cleared",
+        [f["service"] for f in alerts["actionable_faults"]] == ["D"]
+        and alerts["expired_services"] == [],
+        str(alerts),
+    )
+    check(
+        "B/C/A suppressed again without resend",
+        {f["service"] for f in alerts["suppressed_faults"]} == {"A", "B", "C"},
+        str(alerts),
+    )
+
+    # Same-seq retries and rejected reports must not refresh the deadline.
+    _, ttl_before = request("GET", "/ttl")
+    acc_before = next(c for c in ttl_before["configs"] if c["service"] == "D")["accepted_at"]
+    status, body = request("POST", "/reports", {"service": "D", "seq": 2, "status": "fault"})
+    check("same-seq retry idempotent", status == 200 and body["duplicate"] is True, str(body))
+    status, _ = request("POST", "/reports", {"service": "D", "seq": 1, "status": "fault"})
+    check("stale seq rejected", status == 409)
+    _, ttl_after = request("GET", "/ttl")
+    acc_after = next(c for c in ttl_after["configs"] if c["service"] == "D")["accepted_at"]
+    check(
+        "retry/rejected reports do not refresh acceptance time",
+        acc_before == acc_after,
+        f"{acc_before} vs {acc_after}",
+    )
+    time.sleep(2.3)
+    _, alerts = request("GET", "/alerts")
+    check(
+        "D expires again (retry did not extend validity)",
+        any(e["service"] == "D" for e in alerts["expired_services"]),
+        str(alerts),
+    )
+
+
+def test_ttl_adjustment() -> None:
+    print("[T7] TTL set/shorten judged immediately; extend never resurrects")
+    reset()
+    request("POST", "/graph", GRAPH_V1)
+
+    status, body = request("PUT", "/ttl/D", {"ttl_seconds": 60})
+    check("set long ttl", status == 200 and body["expired"] is False, str(body))
+    request("POST", "/reports", {"service": "D", "seq": 1, "status": "fault"})
+    time.sleep(1.3)
+
+    # Shortening below the report's age judges expiry immediately, against
+    # the acceptance time of the last valid report.
+    status, body = request("PUT", "/ttl/D", {"ttl_seconds": 1})
+    check(
+        "shorten below report age -> expired immediately",
+        status == 200 and body["expired"] is True and body["previous_ttl_seconds"] == 60,
+        str(body),
+    )
+    _, alerts = request("GET", "/alerts")
+    check(
+        "alerts reflect the shortening at once",
+        any(e["service"] == "D" for e in alerts["expired_services"]),
+        str(alerts),
+    )
+
+    # Extending the window must not resurrect the expired report.
+    status, body = request("PUT", "/ttl/D", {"ttl_seconds": 3600})
+    check(
+        "extend does not resurrect expired report",
+        status == 200 and body["expired"] is True,
+        str(body),
+    )
+    _, alerts = request("GET", "/alerts")
+    check(
+        "still expired after extension",
+        any(e["service"] == "D" for e in alerts["expired_services"]),
+        str(alerts),
+    )
+
+    # A same-seq retry does not clear expiry either.
+    request("POST", "/reports", {"service": "D", "seq": 1, "status": "fault"})
+    _, alerts = request("GET", "/alerts")
+    check(
+        "same-seq retry does not clear expiry",
+        any(e["service"] == "D" for e in alerts["expired_services"]),
+        str(alerts),
+    )
+
+    # Only a higher-seq valid report clears it.
+    status, body = request("POST", "/reports", {"service": "D", "seq": 2, "status": "fault"})
+    check("higher-seq report clears expiry", status == 200 and body["applied"] is True, str(body))
+    _, alerts = request("GET", "/alerts")
+    check(
+        "D down again after higher-seq report",
+        "D" in alerts["down_services"] and alerts["expired_services"] == [],
+        str(alerts),
+    )
+
+    # Silence after a recovery also expires: last status up becomes unknown.
+    request("POST", "/reports", {"service": "D", "seq": 3, "status": "recover"})
+    request("PUT", "/ttl/D", {"ttl_seconds": 1})
+    _, alerts = request("GET", "/alerts")
+    check("recovered D healthy while window valid", "D" in alerts["healthy_services"], str(alerts))
+    time.sleep(1.3)
+    _, alerts = request("GET", "/alerts")
+    expired = {e["service"]: e for e in alerts["expired_services"]}
+    check(
+        "silent after recover -> unknown with last_status up",
+        "D" in expired and expired["D"]["last_status"] == "up"
+        and "D" not in alerts["healthy_services"],
+        str(alerts),
+    )
+
+
+def test_ttl_graph_swap() -> None:
+    print("[T8] graph replacement keeps TTL configs; off-graph services not judged")
+    reset()
+    request("POST", "/graph", GRAPH_V1)
+    request("PUT", "/ttl/Y", {"ttl_seconds": 1})
+    request("PUT", "/ttl/D", {"ttl_seconds": 60})
+    request("POST", "/reports", {"service": "Y", "seq": 1, "status": "fault"})
+    _, alerts = request("GET", "/alerts")
+    check("Y down before swap", "Y" in alerts["down_services"], str(alerts))
+
+    # Swap to v2 (Y removed): Y's config is retained but Y is not judged.
+    status, _ = request("POST", "/graph", GRAPH_V2)
+    check("v2 accepted", status == 200)
+    _, alerts = request("GET", "/alerts")
+    check(
+        "off-graph Y not judged (neither down nor expired)",
+        "Y" not in alerts["down_services"]
+        and all(e["service"] != "Y" for e in alerts["expired_services"]),
+        str(alerts),
+    )
+    _, ttl = request("GET", "/ttl")
+    yconf = next((c for c in ttl["configs"] if c["service"] == "Y"), None)
+    check(
+        "config retained for off-graph service",
+        yconf is not None and yconf["in_graph"] is False and yconf["expired"] is None,
+        str(ttl),
+    )
+    dconf = next((c for c in ttl["configs"] if c["service"] == "D"), None)
+    check(
+        "same-named config kept across swap",
+        dconf is not None and dconf["ttl_seconds"] == 60 and dconf["in_graph"] is True,
+        str(ttl),
+    )
+
+    # Swap back: config + state resurface; the old report is past its window.
+    time.sleep(1.3)
+    request("POST", "/graph", GRAPH_V1)
+    _, alerts = request("GET", "/alerts")
+    expired = {e["service"]: e for e in alerts["expired_services"]}
+    check(
+        "back in graph: Y judged expired from persisted acceptance time",
+        "Y" in expired and expired["Y"]["last_seq"] == 1,
+        str(alerts),
+    )
+
+
+def test_ttl_concurrency() -> None:
+    print("[T9] concurrent ttl config + reports + swaps + queries stay consistent")
+    reset()
+    request("POST", "/graph", GRAPH_V1)
+    for svc in ("A", "B", "C", "D"):
+        request("POST", "/reports", {"service": svc, "seq": 1, "status": "fault"})
+
+    def hammer_ttl():
+        return [
+            request("PUT", f"/ttl/{svc}", {"ttl_seconds": ttl})
+            for svc in "ABCD" for ttl in (1, 2, 3600)
+        ]
+
+    def hammer_reports(services: str):
+        return [
+            request("POST", "/reports", {"service": svc, "seq": i, "status": "fault"})
+            for svc in services for i in range(2, 14)
+        ]
+
+    def hammer_swaps():
+        return [request("POST", "/graph", g) for g in (GRAPH_V2, GRAPH_V1) * 2]
+
+    def hammer_reads():
+        return [request("GET", "/alerts") for _ in range(20)]
+
+    with ThreadPoolExecutor(max_workers=8) as pool:
+        futs = [pool.submit(hammer_ttl) for _ in range(2)]
+        futs += [pool.submit(hammer_reports, "AB"), pool.submit(hammer_reports, "CD")]
+        futs += [pool.submit(hammer_swaps)]
+        futs += [pool.submit(hammer_reads) for _ in range(3)]
+        results = [f.result() for f in futs]
+
+    ttl_results = [r for batch in results[0:2] for r in batch]
+    report_results = [r for batch in results[2:4] for r in batch]
+    swap_results = results[4]
+    read_results = [r for batch in results[5:] for r in batch]
+
+    check("all ttl writes accepted", all(st == 200 for st, _ in ttl_results),
+          str(ttl_results[:3]))
+    check("all reports accepted", all(st == 200 for st, _ in report_results),
+          str(report_results[:3]))
+    check("all swaps accepted", all(st == 200 for st, _ in swap_results), str(swap_results))
+    consistent = all(
+        st == 200 and alerts_partition_consistent(body) for st, body in read_results
+    )
+    check("every interleaved read is a consistent snapshot", consistent,
+          str(read_results[:2]))
+    st, body = request("GET", "/alerts")
+    check("final state consistent", st == 200 and alerts_partition_consistent(body), str(body))
 
 
 def main() -> int:
@@ -467,6 +753,10 @@ def main() -> int:
     test_suppression()
     test_graph_replace_preserves_state()
     test_concurrency()
+    test_ttl_expiry()
+    test_ttl_adjustment()
+    test_ttl_graph_swap()
+    test_ttl_concurrency()
 
     print(f"\n{'-' * 60}\nPASS={PASS} FAIL={FAIL}")
     if FAIL:

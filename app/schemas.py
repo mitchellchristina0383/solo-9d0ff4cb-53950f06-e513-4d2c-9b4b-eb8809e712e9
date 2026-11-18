@@ -31,6 +31,58 @@ class ReportPayload(BaseModel):
     status: Status
 
 
+class TtlPayload(BaseModel):
+    ttl_seconds: int = Field(
+        ...,
+        gt=0,
+        description="Validity window (seconds) for reports of this service, "
+        "counted from the acceptance time of the last valid report",
+    )
+
+
+class TtlResponse(BaseModel):
+    service: str
+    ttl_seconds: int
+    previous_ttl_seconds: Optional[int]
+    in_graph: bool
+    reported: bool
+    expired: bool = Field(
+        ..., description="True when the last valid report is already past its window"
+    )
+    last_status: Optional[Literal["up", "down"]]
+    last_seq: Optional[int]
+    accepted_at: Optional[float]
+
+
+class TtlEntry(BaseModel):
+    service: str
+    ttl_seconds: int
+    in_graph: bool
+    reported: bool
+    expired: Optional[bool] = Field(
+        ..., description="null when the service is not in the current graph or never reported"
+    )
+    last_status: Optional[Literal["up", "down"]]
+    last_seq: Optional[int]
+    accepted_at: Optional[float]
+    updated_at: Optional[str]
+
+
+class TtlListResponse(BaseModel):
+    configs: list[TtlEntry]
+
+
+class ExpiredService(BaseModel):
+    """A service whose last valid report aged out: status is now unknown."""
+
+    service: str
+    last_status: Literal["up", "down"]
+    last_seq: int
+    accepted_at: float
+    ttl_seconds: int
+    deadline: float
+
+
 class RootCause(BaseModel):
     service: str
     paths: list[list[str]]
@@ -57,6 +109,7 @@ class AlertsResponse(BaseModel):
     down_services: list[str]
     unreported_services: list[str]
     healthy_services: list[str]
+    expired_services: list[ExpiredService]
 
 
 class GraphResponse(BaseModel):

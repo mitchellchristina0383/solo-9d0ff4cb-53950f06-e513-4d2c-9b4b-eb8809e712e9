@@ -17,7 +17,11 @@ from .schemas import (
     ReplaceResponse,
     ReportPayload,
     ReportResponse,
+    TtlListResponse,
+    TtlPayload,
+    TtlResponse,
 )
+from .ttl_service import list_ttl, set_ttl
 
 
 @asynccontextmanager
@@ -102,6 +106,30 @@ def post_report(payload: ReportPayload) -> ReportResponse:
     return ReportResponse(**submit_report(payload))
 
 
+@app.put("/ttl/{service}", response_model=TtlResponse, status_code=200)
+def put_ttl(service: str, payload: TtlPayload) -> TtlResponse:
+    """Set or replace the report validity window (seconds) of one service.
+
+    Expiry is judged immediately against the acceptance time of the last
+    valid report: setting or shortening the window can expire a service right
+    away, while extending it never resurrects an already-expired report --
+    only a higher-seq valid report clears expiry.  Services without a config
+    are judged as before.
+    """
+    return TtlResponse(**set_ttl(service, payload.ttl_seconds))
+
+
+@app.get("/ttl", response_model=TtlListResponse)
+def read_ttl() -> TtlListResponse:
+    """List all per-service report validity windows.
+
+    Configs survive graph replacements for same-named services; services not
+    in the current graph keep their config but do not participate in expiry
+    judgement.
+    """
+    return TtlListResponse(**list_ttl())
+
+
 @app.get("/alerts", response_model=AlertsResponse)
 def read_alerts() -> AlertsResponse:
     """Return actionable faults, suppressed faults and their upstream root causes."""
@@ -114,6 +142,7 @@ def admin_reset() -> dict:
     with write_tx() as conn:
         conn.execute("DELETE FROM events")
         conn.execute("DELETE FROM service_state")
+        conn.execute("DELETE FROM report_ttl")
         conn.execute("DELETE FROM edges")
         conn.execute("DELETE FROM nodes")
         conn.execute("DELETE FROM graph_meta")

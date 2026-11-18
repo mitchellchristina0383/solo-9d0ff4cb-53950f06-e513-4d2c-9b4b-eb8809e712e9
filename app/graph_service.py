@@ -2,11 +2,13 @@
 from __future__ import annotations
 
 import sqlite3
+import time
 from collections import deque
 
 from .database import read_tx, write_tx
 from .errors import GraphError, NoGraph
 from .schemas import GraphPayload, GraphResponse, ServiceIn
+from .ttl_service import expired_service_map
 
 # ---------------------------------------------------------------------------
 # Validation
@@ -193,11 +195,15 @@ def classify_alerts() -> dict:
 
     A faulty service is *suppressed* only when there exists a dependency path
     on which **every** node is faulty leading to a root cause (a faulty
-    service with no faulty upstream).  Healthy or never-reported nodes cut
-    paths, so a fault behind such a node stays actionable.
+    service with no faulty upstream).  Healthy, never-reported or **expired**
+    nodes cut paths, so a fault behind such a node stays actionable.  Expired
+    services (last valid report older than their configured TTL) are listed
+    separately as status-unknown with their last status and seq.
     """
     with read_tx() as conn:
         revision, version, upstream = _load_graph(conn)
+        now = time.time()
+        expired = expired_service_map(conn, now)
         down: set[str] = {
             r["service"]
             for r in conn.execute("SELECT service FROM service_state WHERE status = 'down'")
@@ -207,7 +213,9 @@ def classify_alerts() -> dict:
             for r in conn.execute("SELECT service, last_seq FROM service_state")
         }
 
-    down_here = {s for s in down if s in upstream}
+    # Expired services are status-unknown: not down, not healthy, and they
+    # cut dependency paths exactly like healthy/unreported nodes do.
+    down_here = {s for s in down if s in upstream and s not in expired}
     roots = sorted(s for s in down_here if not any(u in down_here for u in upstream[s]))
 
     # Memoized DFS over the DAG: roots reachable from a node through down nodes only.
@@ -263,7 +271,10 @@ def classify_alerts() -> dict:
 
     all_nodes = set(upstream)
     unreported = sorted(all_nodes - set(seq_rows))
-    healthy = sorted(s for s in seq_rows if s in all_nodes and s not in down_here)
+    healthy = sorted(
+        s for s in seq_rows if s in all_nodes and s not in down_here and s not in expired
+    )
+    expired_list = [expired[s] for s in sorted(expired)]
 
     return {
         "graph_revision": revision,
@@ -274,4 +285,5 @@ def classify_alerts() -> dict:
         "down_services": sorted(down_here),
         "unreported_services": unreported,
         "healthy_services": healthy,
+        "expired_services": expired_list,
     }
